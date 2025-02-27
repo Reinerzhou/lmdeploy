@@ -124,6 +124,7 @@ class FusedMoE(nn.Module):
                  device: Optional[torch.device] = None,
                  all_reduce: bool = True,
                  enable_ep: bool = False):
+        enable_ep = True
         super().__init__()
         if device is None:
             device = torch.device('cpu')

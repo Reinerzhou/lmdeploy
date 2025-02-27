@@ -247,13 +247,15 @@ def main():
         engine_config = PytorchEngineConfig(
             session_len=args.session_len,
             cache_max_entry_count=args.cache_max_entry_count,
-            block_size=args.cache_block_seq_len,
+            block_size=16,
+            # block_size=args.cache_block_seq_len,
             max_batch_size=args.concurrency,
             tp=args.tp,
             eager_mode=args.eager_mode,
             enable_prefix_caching=args.enable_prefix_caching,
             quant_policy=args.quant_policy,
             dtype=args.dtype,
+            device_type='maca',
         )
 
     if args.use_uvloop:

@@ -37,7 +37,7 @@ class MacaOpsBackend(DlinferOpsBackend):
         head_size: int,
         dtype: torch.dtype,
     ) -> Tuple[int, ...]:
-        return (num_heads, block_size, head_size)
+        return (num_heads, head_size, block_size)
 
     @classmethod
     def update_step_context(cls, step_context):
@@ -52,7 +52,7 @@ class MacaOpsBackend(DlinferOpsBackend):
             return cls.total_slots
 
         kv_start_indices, attention_mask = [], []
-        block_num, _, block_size, _ = step_context.kv_caches[0][1].shape
+        block_num, _, _, block_size = step_context.kv_caches[0][1].shape
         device = step_context.block_offsets.device
 
         is_unpaged_prefill = False
