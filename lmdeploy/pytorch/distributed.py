@@ -229,12 +229,23 @@ def get_dp_group(device: str = 'gpu'):
         return ctx.dp_gpu_group
 
 
+def get_ep_group(device: str = 'gpu'):
+    """Get dp group."""
+    ctx = get_dist_manager().current_context()
+
+    _check_group_device(device)
+
+    return ctx.ep_gpu_group
+
+
 def get_group(group_type: str, device: str):
     """Get group."""
     if group_type == 'tp':
         return get_tp_group(device)
     elif group_type == 'dp':
         return get_dp_group(device)
+    elif group_type == 'ep':
+        return get_ep_group(device)
     elif group_type in ['world', 'all']:
         return get_process_group(device)
     else:

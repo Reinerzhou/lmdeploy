@@ -109,3 +109,14 @@ class MacaOpsBackend(DlinferOpsBackend):
         """Build graph runner."""
         from lmdeploy.pytorch.backends.cuda.graph_runner import CUDAGraphRunner
         return CUDAGraphRunner(model, model_config, cache_config, backend_config, device)
+
+    @staticmethod
+    def device_count():
+        """Get num available devices."""
+        return torch.cuda.device_count()
+
+    @staticmethod
+    def support_ray():
+        """Support ray."""
+        return True
+        # return False

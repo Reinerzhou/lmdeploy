@@ -264,6 +264,7 @@ def _get_exp_mask(topk_ids: torch.Tensor, num_experts: int):
     """Get exp mask."""
     assert topk_ids.dim() == 2
     M, topk = topk_ids.shape
+    print('topk, num_experts,', topk, num_experts, flush=True)
     assert topk <= num_experts
 
     out_mask = topk_ids.new_empty((num_experts, M))

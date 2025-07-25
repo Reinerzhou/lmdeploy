@@ -36,6 +36,8 @@ def get_device_str():
         device_type = 'GPU'
     elif device_type == 'ascend':
         device_type = 'NPU'
+    elif device_type == 'maca':
+        device_type = 'GPU'
     else:
         raise ValueError(f'Unsupported device type: {device_type}')
 
@@ -621,7 +623,8 @@ class RayExecutor(ExecutorBase):
         driver_ip = _get_master_addr()
         if device_str == 'cuda':
             self.workers = self._sort_workers(driver_ip, self.workers)
-
+        elif device_str == 'maca':
+            self.workers = self._sort_workers(driver_ip, self.workers)
         elif device_str == 'ascend':
             self._init_ascend_distributed_environment(driver_ip)
         else:

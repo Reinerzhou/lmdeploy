@@ -140,7 +140,8 @@ def _gather_input(x: torch.Tensor, tp_sizes: List[int]):
 
 def _reduce_scatter_input(out: torch.Tensor, tp_sizes: List[int]):
     """Reduce scatter."""
-    _, rank = get_tp_world_rank()
+    # _, rank = get_tp_world_rank()
+    _, rank = get_ep_world_rank()
     out = out.transpose(0, -2)
     if not out.is_contiguous():
         out = out.contiguous()
@@ -210,9 +211,12 @@ class FusedMoE(nn.Module):
             dtype = torch.float16
         ep_size, rank = get_ep_world_rank()
         impl_builder = get_backend().get_layer_impl_builder(OpType.FusedMoE)
+        print('ep_size, rank:', ep_size, rank, flush=True)
         self.impl = impl_builder.build(top_k, num_experts, renormalize, ep_size)
 
         enable_ep = self.impl.support_ep() and ep_size != 1
+        print('enable_ep', enable_ep, flush=True)
+
         if enable_ep:
             expert_list = self.impl.ep_expert_list(ep_size, rank)
             num_experts = len(expert_list)
@@ -258,11 +262,23 @@ class FusedMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.LongTensor):
         hidden_states, topk_weights, topk_ids = _moe_gather_inputs(hidden_states, topk_weights, topk_ids, False)
+        # print("test info:", flush=True)
+        # print("self.enable_ep", self.enable_ep, flush=True)
+        # hidden_states, topk_weights, topk_ids = _moe_gather_inputs(hidden_states,
+        #                                                            topk_weights, topk_ids, self.enable_ep)
 
         ret = self.impl.forward(hidden_states, topk_weights, topk_ids, self.gate_up.weight, self.down.weight,
                                 self.expert_list)
+
+        # dist_ctx = get_dist_manager().current_context()
+        # print('self.all_reduce', self.all_reduce, dist_ctx, flush=True)
+        # dist.all_reduce(ret, group="tp")
+        # print('before:', flush=True)
         if self.all_reduce:
             ret = _moe_reduce(ret, False)
+            # ret = _moe_reduce(ret, self.enable_ep)
+        # print('after:', flush=True)
+
         return ret
 
 
