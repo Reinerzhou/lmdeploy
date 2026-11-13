@@ -8,6 +8,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from lmdeploy.messages import EngineEvent, EventType
 from lmdeploy.pytorch.kv_connector.base import (
     KVConnectorOutput,
     KVConnectorResult,
@@ -17,6 +18,7 @@ from lmdeploy.pytorch.kv_connector.base import (
 )
 from lmdeploy.pytorch.long_context import get_last_prefill_save_step
 from lmdeploy.pytorch.paging.state_manager import StateAllocator
+from lmdeploy.trace import ENABLED as TRACE_ENABLED
 from lmdeploy.utils import get_logger
 
 from .data import (
@@ -43,6 +45,8 @@ class _RequestHashTracker:
 
     adapter_identity: str
     block_hashes: tuple[bytes, ...] = ()
+    trace_lookup_pending: bool = False
+    trace_events: list[EngineEvent] | None = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +161,12 @@ class MooncakeStoreScheduler:
             if token_len == 0:
                 continue
             hashes = self._get_request_block_hashes(request, req_id, token_len, self._cache_config.block_size)
+            if TRACE_ENABLED:
+                tracker = self._request_hash_trackers[req_id]
+                if not tracker.trace_lookup_pending:
+                    request.record_event(EventType.KV_LOOKUP_STARTED)
+                    tracker.trace_lookup_pending = True
+                    tracker.trace_events = request.engine_events
             client.submit(req_id, token_len, hashes, recompute_blocks=recompute_blocks)
 
     def _lookup_range(self, request: SchedulerSequence, num_computed_tokens: int) -> tuple[int, int]:
@@ -226,6 +236,11 @@ class MooncakeStoreScheduler:
             token_len,
             block_size,
         )
+        tracker = self._request_hash_trackers[req_id] if TRACE_ENABLED else None
+        if tracker is not None and not tracker.trace_lookup_pending:
+            request.record_event(EventType.KV_LOOKUP_STARTED)
+            tracker.trace_lookup_pending = True
+            tracker.trace_events = request.engine_events
         remote_token_len = self.client.lookup(
             req_id,
             token_len,
@@ -246,6 +261,10 @@ class MooncakeStoreScheduler:
                     or request.clamp_prefix_cache_match_step(remote_token_len) != remote_token_len):
                 logger.error('Mooncake hybrid lookup returned an invalid state boundary: request_id=%s boundary=%d',
                              req_id, remote_token_len)
+                if tracker is not None and tracker.trace_lookup_pending:
+                    request.record_event(EventType.KV_LOOKUP_FINISHED, value=0)
+                    tracker.trace_lookup_pending = False
+                    tracker.trace_events = None
                 return 0, False
         else:
             # FA can reuse a shorter prefix if the hit ends inside a media span.
@@ -255,6 +274,10 @@ class MooncakeStoreScheduler:
         # position is inside a block, paging expands the load start down to the
         # previous block boundary and loads that whole block.
         num_external_tokens = max(0, int(remote_token_len) - int(num_computed_tokens))
+        if tracker is not None and tracker.trace_lookup_pending:
+            request.record_event(EventType.KV_LOOKUP_FINISHED, value=num_external_tokens)
+            tracker.trace_lookup_pending = False
+            tracker.trace_events = None
         if num_external_tokens == 0:
             if self._kv_transfer_config.is_kv_producer:
                 self._next_save_block[req_id] = int(remote_token_len) // block_size
@@ -664,6 +687,12 @@ class MooncakeStoreScheduler:
         """Cancel only the current lookup, retaining incremental hashes."""
         if self.client is not None:
             self.client.discard(int(request_id))
+        tracker = self._request_hash_trackers.get(int(request_id))
+        if tracker is not None:
+            if tracker.trace_lookup_pending and tracker.trace_events is not None:
+                tracker.trace_events.append(EngineEvent.new_event(EventType.KV_LOOKUP_CANCELLED))
+            tracker.trace_lookup_pending = False
+            tracker.trace_events = None
 
     def update_connector_output(
         self,
@@ -719,8 +748,7 @@ class MooncakeStoreScheduler:
     ) -> None:
         """Discard request-local lookup and save-boundary state."""
         req_id = int(request.seq_id)
-        if self.client is not None:
-            self.client.discard(req_id)
+        self.cancel_lookup(req_id)
         self._request_hash_trackers.pop(req_id, None)
         self._lookup_plans.pop(req_id, None)
         self._pending_loads.pop(req_id, None)
