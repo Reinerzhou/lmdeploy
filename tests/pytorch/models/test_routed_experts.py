@@ -230,3 +230,26 @@ class TestGlm5NextRoutedExperts:
         torch.testing.assert_close(weights, actual_weights, rtol=0, atol=0)
         torch.testing.assert_close(ids, actual_ids, rtol=0, atol=0)
         torch.testing.assert_close(ids.int(), capture.int(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float16])
+def test_glm5_next_moe_preserves_fp32_reduction_after_communicator_refactor(monkeypatch, dtype):
+    from lmdeploy.pytorch.models import glm5_next
+
+    moe = bare(Glm5NextMoE)
+    moe._fp32_tp_reduce = True
+    value = torch.ones(2, 4, dtype=dtype)
+    monkeypatch.setattr(glm5_next.DeepseekV2MoE, 'forward', lambda self, x, **kwargs: x)
+    group = object()
+    monkeypatch.setattr(glm5_next, 'get_dist_group', lambda name: SimpleNamespace(gpu_group=group))
+    calls = []
+
+    def reduce(tensor, *, group):
+        calls.append((tensor.dtype, group))
+        tensor.mul_(2)
+
+    monkeypatch.setattr(glm5_next, 'all_reduce', reduce)
+    result = moe(value)
+    assert calls == [(torch.float32, group)]
+    assert result.dtype == dtype
+    torch.testing.assert_close(result, torch.full_like(value, 2))

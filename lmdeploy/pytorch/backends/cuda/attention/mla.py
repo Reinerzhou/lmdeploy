@@ -14,7 +14,7 @@ from lmdeploy.pytorch.backends.cp_utils import (
 from lmdeploy.utils import get_logger
 
 from ..step_metadata import CudaAttentionMetaBuilder
-from .cp import gather_dcp_prefix_kv, gather_dcp_query, merge_dcp_attention
+from .cp import get_dcp_manager
 from .default import TritonAttentionImpl, TritonAttentionMetadata
 
 logger = get_logger('lmdeploy')
@@ -253,6 +253,11 @@ class FlashMLAImpl(TritonAttentionImpl):
         self.flatten_kv_cache_mla_fp8 = flatten_kv_cache_mla_fp8
         assert num_kv_heads == 1, 'MLA requires num kv heads equal to 1'
         self.use_fa3 = use_fa3
+
+        if self.dcp_world_size > 1:
+            self.dcp_manager = get_dcp_manager()
+            self.dcp_manager.prepare_attention(num_heads, head_size)
+            self.dcp_manager.prepare_prefix_gather(head_size)
 
     def get_step_metadata_provider(self):
         """Describe metadata required by this selected implementation."""
@@ -537,7 +542,7 @@ class FlashMLAImpl(TritonAttentionImpl):
             k_scales_zeros=k_scales_zeros,
             v_scales_zeros=v_scales_zeros,
         )
-        context_k = gather_dcp_prefix_kv(local_k, chunk)
+        context_k = self.dcp_manager.gather_prefix(local_k, chunk)
         return context_k, chunk.cu_seqlens
 
     def _prefill_dcp_context(
@@ -756,7 +761,7 @@ class FlashMLAImpl(TritonAttentionImpl):
         if self.dcp_world_size == 1:
             return self._decoding_paged(query, k_cache, attn_metadata)
 
-        query = gather_dcp_query(query, dcp_world_size=self.dcp_world_size)
+        query = self.dcp_manager.gather_query(query)
         query_len = query.size(0) // attn_metadata.q_seqlens.numel()
         if query_len > 1:
             # Consecutive global queries do not advance each interleaved
@@ -771,11 +776,10 @@ class FlashMLAImpl(TritonAttentionImpl):
             )
         local_output, local_lse = self._decoding_paged(
             query, k_cache, attn_metadata, causal=False, return_lse=True)
-        return merge_dcp_attention(
+        return self.dcp_manager.combine(
             local_output,
             local_lse,
-            valid_counts=attn_metadata.dcp_local_kv_seqlens,
-            dcp_world_rank=(self.dcp_world_size, self.dcp_rank))
+            valid_counts=attn_metadata.dcp_local_kv_seqlens)
 
     def _forward_prefill(
         self,

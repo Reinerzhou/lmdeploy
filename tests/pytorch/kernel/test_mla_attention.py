@@ -9,7 +9,7 @@ from lmdeploy.pytorch.backends.attention import PagedAttentionBuildSpec
 from lmdeploy.pytorch.backends.cuda import attention as attention_module
 from lmdeploy.pytorch.backends.cuda.attention import mla as mla_module
 from lmdeploy.pytorch.backends.cuda.attention import sparse_mla as sparse_mla_module
-from lmdeploy.pytorch.backends.cuda.attention.cp import gather_dcp_query
+from lmdeploy.pytorch.backends.cuda.attention.cp import DCPManager
 from lmdeploy.pytorch.backends.cuda.attention.sparse_mla import (
     FlashMLAIndexMapper,
     FlashMLASparseImpl,
@@ -146,6 +146,7 @@ def test_dcp_query_all_gather_preserves_contiguous_head_order(monkeypatch, devic
     if device == 'cuda' and not torch.cuda.is_available():
         pytest.skip('requires CUDA')
     from lmdeploy.pytorch import distributed
+    from lmdeploy.pytorch.backends.communicator import DeviceCommunicator
 
     queries = torch.arange(dcp_size * num_tokens * 3 * 8, device=device, dtype=torch.float32)
     queries = queries.reshape(dcp_size, num_tokens, 3, 8)
@@ -159,11 +160,14 @@ def test_dcp_query_all_gather_preserves_contiguous_head_order(monkeypatch, devic
         if not strided:
             assert input_tensor.data_ptr() == rank0_query.data_ptr()
         for rank in range(dcp_size):
-            source = queries[rank].transpose(0, 1) if strided else queries[rank]
+            source = queries[rank].flatten(1)
             output[rank * source.size(0):(rank + 1) * source.size(0)].copy_(source)
 
-    monkeypatch.setattr(distributed, 'all_gather_into_tensor', fake_all_gather)
-    gathered = gather_dcp_query(rank0_query, dcp_world_size=dcp_size)
+    monkeypatch.setattr(torch.distributed, 'all_gather_into_tensor', fake_all_gather)
+    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda group: dcp_size)
+    group = distributed.DistGroup(gpu_group='dcp', communicator=DeviceCommunicator('dcp'))
+    manager = DCPManager(group)
+    gathered = manager.gather_query(rank0_query)
 
     expected = torch.cat(list(queries), dim=1)
     assert torch.equal(gathered, expected)
@@ -175,7 +179,7 @@ def test_dcp_query_all_gather_preserves_contiguous_head_order(monkeypatch, devic
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            graph_output = gather_dcp_query(rank0_query, dcp_world_size=dcp_size)
+            graph_output = manager.gather_query(rank0_query)
         queries.add_(1)
         graph.replay()
         torch.cuda.synchronize()
@@ -499,6 +503,12 @@ def test_dcp_cached_prefill_matches_reference_across_chunks(monkeypatch, sparse,
                                                         mla_index_topk=512 if sparse else None),
                            kv_quant_policy=0)
     monkeypatch.setattr(distributed, 'get_dcp_world_rank', lambda: (dcp_size, 0))
+    # This prefill test simulates ranks without creating process groups.
+    manager = object.__new__(DCPManager)
+    manager._prefix_workspaces = {}
+    manager.prepare_attention = Mock()
+    manager.prepare_prefix_gather = Mock()
+    monkeypatch.setattr(mla_module, 'get_dcp_manager', lambda: manager)
     # One virtual block per chunk, with an empty second request in every chunk.
     monkeypatch.setattr(cp_utils, 'get_dcp_prefill_workspace_size',
                         lambda **kwargs: 2 * 64 * (1 + 2 * dcp_size) * 576 * 2)
@@ -536,9 +546,10 @@ def test_dcp_cached_prefill_matches_reference_across_chunks(monkeypatch, sparse,
         reference_keys[:prefix_length, :, :512] = latent.flatten(-2).to(torch.bfloat16)
     gather_calls = 0
 
-    def gather(output, local, group='tp'):
+    def gather(local, **kwargs):
         nonlocal gather_calls
-        assert group == 'dcp'
+        local = local.view(-1, 1, 576)
+        output = local.new_empty(dcp_size * local.size(0), 1, 576)
         chunk = metadata.dcp_prefix_chunks[gather_calls]
         prefix = reference_keys[chunk.start:min(chunk.start + chunk.size, prefix_length)]
         torch.testing.assert_close(local[:prefix[::dcp_size].size(0)], prefix[::dcp_size], atol=0, rtol=0)
@@ -548,8 +559,9 @@ def test_dcp_cached_prefill_matches_reference_across_chunks(monkeypatch, sparse,
             remote.zero_()
             remote[:prefix[rank::dcp_size].size(0)].copy_(prefix[rank::dcp_size])
         gather_calls += 1
+        return output.flatten(1)
 
-    monkeypatch.setattr(distributed, 'all_gather_into_tensor', gather)
+    manager.communicator = SimpleNamespace(all_gather=gather)
     indices = None
     if use_sparse:
         # Non-contiguous selections span cached chunks and current tokens.
@@ -635,9 +647,7 @@ def test_dcp_attention_correction_kernel_matches_torch(dtype):
 @pytest.mark.parametrize('dcp_size', [2, 4])
 @pytest.mark.parametrize('gather_prefix', [False, True], ids=['kernel', 'gather'])
 def test_reorder_dcp_prefill_kv_handles_uneven_requests(monkeypatch, dcp_size, gather_prefix):
-    from lmdeploy.pytorch import distributed
     from lmdeploy.pytorch.backends import cp_utils
-    from lmdeploy.pytorch.backends.cuda.attention.cp import gather_dcp_prefix_kv
     from lmdeploy.pytorch.kernels.cuda.dcp import reorder_dcp_prefill_kv
 
     device = 'cuda'
@@ -663,13 +673,14 @@ def test_reorder_dcp_prefill_kv_handles_uneven_requests(monkeypatch, dcp_size, g
         expected[:valid_values.numel(), 0] = valid_values
         gathered = gathered.flatten(0, 1)
         if gather_prefix:
-            def all_gather(destination, local, *, group):
-                assert group == 'dcp'
+            def all_gather(local, **kwargs):
                 assert local.size(0) == local_capacity
-                destination.copy_(gathered)
+                return gathered
 
-            monkeypatch.setattr(distributed, 'all_gather_into_tensor', all_gather)
-            output = gather_dcp_prefix_kv(gathered[:local_capacity], chunk, zero_padding=True)
+            manager = object.__new__(DCPManager)
+            manager.communicator = SimpleNamespace(all_gather=all_gather)
+            manager._prefix_workspaces = {}
+            output = manager.gather_prefix(gathered[:local_capacity], chunk, zero_padding=True)
         else:
             reorder_dcp_prefill_kv(gathered,
                                    output,
